@@ -454,10 +454,6 @@ struct vy_range {
 	struct vy_index *index;
 	/* Size of data stored on disk (sum of run->info.size). */
 	uint64_t size;
-	/** Total amount of memory used by this range (sum of mem->used). */
-	size_t used;
-	/** Minimal in-memory lsn (min over mem->min_lsn). */
-	int64_t min_lsn;
 	/** New run created for dump/compaction. */
 	struct vy_run *new_run;
 	/**
@@ -467,24 +463,36 @@ struct vy_range {
 	struct rlist runs;
 	/** Number of entries in the ->runs list. */
 	int run_count;
-	/** Active in-memory index, i.e. the one used for insertions. */
-	struct vy_mem *mem;
 	/**
-	 * List of frozen in-memory indexes, i.e. indexes that can't
-	 * be inserted into, only read from, linked by vy_mem->in_frozen.
-	 * The newer an index, the closer it to the list head.
+	 * Number of infiniruns to compact.
+	 *
+	 *         infiniruns
+	 * +-----------------------+ \
+	 * +-----------------------+  --> level_zero_run_count
+	 * +-----------------------+ /
+	 *     -- max_used_lsn --
+	 *   ... more infiniruns
 	 */
-	struct rlist frozen;
+	int level_zero_run_count;
+	/**
+	 * Estimated size of the runs on the level zero.
+	 * Calculated as summary of infinirun page sizes
+	 * intersected with this range.
+	 */
+	uint64_t est_level_zero_size;
+	/**
+	 * Maximal level zero statements count. Calculated like
+	 * est_level_zero_size, but stored count of statements
+	 * instead of size.
+	 */
+	uint32_t level_zero_max_statements_count;
 	/**
 	 * Size of the largest run that was dumped since the last
 	 * range compaction. Required for computing the size of
 	 * the base level in the LSM tree.
 	 */
 	uint64_t max_dump_size;
-	/**
-	 * Maximal LSN used by this range for compactions and
-	 * dumps.
-	 */
+	/** Maximal LSN used by this range for compactions. */
 	int64_t compact_max_lsn;
 	/**
 	 * The goal of compaction is to reduce read amplification.
@@ -512,6 +520,8 @@ struct vy_range {
 	int compact_priority;
 	/** Number of times the range was compacted. */
 	int n_compactions;
+	/** Max lsn, seen by this range in the infinirange. */
+	int64_t max_used_lsn;
 	/**
 	 * If this range is a part of a range that is being split,
 	 * this field points to the original range.
@@ -523,9 +533,8 @@ struct vy_range {
 	 */
 	struct rlist split_list;
 	rb_node(struct vy_range) tree_node;
-	struct heap_node   in_compact;
-	struct heap_node   in_dump;
-	struct heap_node   in_max_lsn;
+	struct heap_node in_compact;
+	struct heap_node in_max_lsn;
 	/**
 	 * Incremented whenever an in-memory index or on disk
 	 * run is added to or deleted from this range. Used to
@@ -533,10 +542,10 @@ struct vy_range {
 	 */
 	uint32_t version;
 	/**
-	 * Ranges tree now is flat, so this flag always is true.
-	 * But when we will have introduced the single mem per
-	 * index, this flag will be false for ranges from the
-	 * index tree and true for the index range.
+	 * Ranges tree have two levels - on first the
+	 * infinirange of the index is placed and on the second -
+	 * ranges from index tree are placed. I.e. this flag is
+	 * true for infiniranges.
 	 */
 	bool is_level_zero;
 	/**
@@ -549,6 +558,9 @@ struct vy_range {
 	 * ranges.
 	 */
 	uint64_t saved_max_dump_size;
+	int saved_level_zero_run_count;
+	uint64_t saved_est_level_zero_size;
+	uint32_t saved_level_zero_max_statements_count;
 };
 
 typedef rb_tree(struct vy_range) vy_range_tree_t;
@@ -655,8 +667,33 @@ struct vy_index {
 	uint64_t stmt_count;
 	/** Size of data stored on disk. */
 	uint64_t size;
+	/**
+	 * Global index range [-inf, +inf].
+	 * Infinirange is single per index, can't be splitted,
+	 * compacted or coalesced. Infinirange doesn't participate
+	 * in MIN({max_used_lsn}) calculation.
+	 */
+	struct vy_range *infinirange;
 	/** Amount of memory used by in-memory indexes. */
 	uint64_t used;
+	/**
+	 * Minimal in-memory lsn (min over mem->min_lsn) of this
+	 * index (not of all indexes).
+	 */
+	int64_t min_lsn;
+	/**
+	 * Active in-memory index, i.e. the one used to insert new
+	 * statements.
+	 */
+	struct vy_mem *mem;
+	/**
+	 * List of frozen in-memory indexes, i.e. indexes that
+	 * can't be inserted into, only read from, linked by
+	 * vy_mem->in_frozen. The newer a mem, the closer it to
+	 * the list head.
+	 */
+	struct rlist frozen;
+	struct heap_node in_dump;
 	/** Histogram of number of runs in range. */
 	struct histogram *run_hist;
 	/**
@@ -734,6 +771,12 @@ struct vy_index {
 /** @sa implementation for details. */
 extern struct vy_index *
 vy_index(struct Index *index);
+
+static inline bool
+vy_index_is_scheduled(const struct vy_index *index)
+{
+	return index->in_dump.pos == UINT32_MAX;
+}
 
 /**
  * Get struct vy_index by a space index with the specified
@@ -1579,20 +1622,6 @@ vy_run_record_gc(const char *vinyl_dir, const struct vy_log_record *record)
 }
 
 static void
-vy_index_acct_mem(struct vy_index *index, struct vy_mem *mem)
-{
-	index->used += mem->used;
-	index->stmt_count += mem->tree.size;
-}
-
-static void
-vy_index_unacct_mem(struct vy_index *index, struct vy_mem *mem)
-{
-	index->used -= mem->used;
-	index->stmt_count -= mem->tree.size;
-}
-
-static void
 vy_index_acct_run(struct vy_index *index, struct vy_run *run)
 {
 	index->run_count++;
@@ -1613,11 +1642,6 @@ vy_index_unacct_run(struct vy_index *index, struct vy_run *run)
 static void
 vy_index_acct_range(struct vy_index *index, struct vy_range *range)
 {
-	if (range->mem != NULL)
-		vy_index_acct_mem(index, range->mem);
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &range->frozen, in_frozen)
-		vy_index_acct_mem(index, mem);
 	struct vy_run *run;
 	rlist_foreach_entry(run, &range->runs, in_range)
 		vy_index_acct_run(index, run);
@@ -1627,11 +1651,6 @@ vy_index_acct_range(struct vy_index *index, struct vy_range *range)
 static void
 vy_index_unacct_range(struct vy_index *index, struct vy_range *range)
 {
-	if (range->mem != NULL)
-		vy_index_unacct_mem(index, range->mem);
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &range->frozen, in_frozen)
-		vy_index_unacct_mem(index, mem);
 	struct vy_run *run;
 	rlist_foreach_entry(run, &range->runs, in_range)
 		vy_index_unacct_run(index, run);
@@ -1750,7 +1769,7 @@ vy_range_discard_new_run(struct vy_range *range)
 static bool
 vy_range_is_scheduled(struct vy_range *range)
 {
-	return range->in_dump.pos == UINT32_MAX;
+	return range->in_compact.pos == UINT32_MAX;
 }
 
 static void
@@ -1759,6 +1778,12 @@ static void
 vy_scheduler_update_range(struct vy_scheduler *, struct vy_range *range);
 static void
 vy_scheduler_remove_range(struct vy_scheduler *, struct vy_range*);
+static void
+vy_scheduler_add_index(struct vy_scheduler *, struct vy_index *index);
+static void
+vy_scheduler_update_index(struct vy_scheduler *, struct vy_index *index);
+static void
+vy_scheduler_remove_index(struct vy_scheduler *, struct vy_index *index);
 static void
 vy_scheduler_mem_dirtied(struct vy_scheduler *scheduler, struct vy_mem *mem);
 static void
@@ -1784,16 +1809,7 @@ vy_range_tree_free_cb(vy_range_tree_t *t, struct vy_range *range, void *arg)
 	struct vy_index *index = (struct vy_index *) arg;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 
-	/*
-	 * Exempt the range along with all its in-memory indexes
-	 * from the scheduler.
-	 */
-	if (range->mem != NULL)
-		vy_scheduler_mem_dumped(scheduler, range->mem);
-	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &range->frozen, in_frozen)
-		vy_scheduler_mem_dumped(scheduler, mem);
-	if (range->in_dump.pos != UINT32_MAX) {
+	if (! vy_range_is_scheduled(range)) {
 		/*
 		 * The range could have already been removed
 		 * by vy_schedule().
@@ -2021,11 +2037,11 @@ check:
 	 * several new ranges, each of which has ->shadow pointing to
 	 * the original range (see vy_task_split_new()). New ranges
 	 * must not be read from until split has finished, because they
-	 * only contain in-memory data added after split was initiated,
-	 * while on-disk runs and older in-memory indexes are still
-	 * linked to the original range. So whenever we encounter such
-	 * a range we return ->shadow instead, and assume that the
-	 * caller will handle it (as vy_read_iterator_add_mem() does).
+	 * contain nothing after split was initiated, and on-disk
+	 * runs are still linked to the original range. So
+	 * whenever we encounter such a range we return ->shadow
+	 * instead, and assume that the caller will handle it
+	 * (as vy_read_iterator_add_mem() does).
 	 * Note, we have to be careful not to return the same range
 	 * twice.
 	 */
@@ -2058,6 +2074,46 @@ vy_range_iterator_restore(struct vy_range_iterator *itr,
 	itr->curr_range = curr;
 	*result = curr->shadow != NULL ? curr->shadow : curr;
 }
+
+#ifndef NDEBUG
+
+static void
+vy_range_info(struct vy_range *range)
+{
+	say_info("%s: range info %s: id = %lld, bsize = %llu, run_count = %d, "\
+		 "compact_priority = %d, n_compactions = %d, "\
+		 "is_level_zero = %s", range->index->name, vy_range_str(range),
+		 (long long) range->id, (unsigned long long) range->size,
+		 range->run_count, range->compact_priority,
+		 range->n_compactions, range->is_level_zero ? "yes" : "no");
+}
+
+static void
+vy_index_info_ranges(struct vy_index *index)
+{
+	struct vy_range_iterator ri;
+	struct tuple *key = vy_stmt_new_select(index->env->key_format, NULL, 0);
+	if (key == NULL)
+		return;
+	struct vy_range *range = NULL;
+	vy_range_iterator_open(&ri, index, ITER_GE, key);
+	vy_range_iterator_next(&ri, &range);
+	say_info("%s: begin of ranges info", index->name);
+	vy_range_info(index->infinirange);
+	while (range != NULL) {
+		vy_range_info(range);
+		vy_range_iterator_next(&ri, &range);
+	}
+	say_info("%s: end of ranges info", index->name);
+	tuple_unref(key);
+}
+
+#else
+
+#define vy_range_info(range) (void)(range)
+#define vy_index_info_ranges(index) (void)(index)
+
+#endif
 
 static void
 vy_index_add_range(struct vy_index *index, struct vy_range *range)
@@ -2787,25 +2843,14 @@ static struct vy_range *
 vy_range_new(struct vy_index *index, int64_t id,
 	     const char *begin, const char *end)
 {
-	struct tx_manager *xm = index->env->xm;
-	struct lsregion *allocator = &index->env->allocator;
-	const int64_t *allocator_lsn = &xm->lsn;
-
 	struct vy_range *range = (struct vy_range*) calloc(1, sizeof(*range));
 	if (range == NULL) {
 		diag_set(OutOfMemory, sizeof(struct vy_range), "malloc",
 			 "struct vy_range");
 		goto fail;
 	}
-	range->mem = vy_mem_new(allocator, allocator_lsn,
-				index->index_def, index->space_format,
-				index->space_format_with_colmask,
-				index->upsert_format);
-	if (range->mem == NULL)
-		goto fail_mem;
 	/* Allocate a new id unless specified. */
 	range->id = (id >= 0 ? id : vy_log_next_range_id());
-	range->is_level_zero = true;
 	if (begin != NULL) {
 		range->begin = vy_key_dup(begin);
 		if (range->begin == NULL)
@@ -2817,10 +2862,7 @@ vy_range_new(struct vy_index *index, int64_t id,
 			goto fail_end;
 	}
 	rlist_create(&range->runs);
-	rlist_create(&range->frozen);
-	range->min_lsn = INT64_MAX;
 	range->index = index;
-	range->in_dump.pos = UINT32_MAX;
 	range->in_compact.pos = UINT32_MAX;
 	rlist_create(&range->split_list);
 	return range;
@@ -2828,8 +2870,6 @@ fail_end:
 	if (range->begin != NULL)
 		free(range->begin);
 fail_begin:
-	vy_mem_delete(range->mem);
-fail_mem:
 	free(range);
 fail:
 	return NULL;
@@ -2932,79 +2972,70 @@ fail:
 	return -1;
 }
 
-/* Move the active in-memory index of a range to the frozen list. */
+/**
+ * Move the active in-memory index of an index to the frozen list.
+ */
 static void
-vy_range_freeze_mem(struct vy_range *range)
+vy_index_freeze_mem(struct vy_index *index)
 {
-	assert(range->mem != NULL);
-	rlist_add_entry(&range->frozen, range->mem, in_frozen);
-	range->mem = NULL;
-}
-
-/* Activate the newest frozen in-memory index of a range. */
-static void
-vy_range_unfreeze_mem(struct vy_range *range)
-{
-	assert(range->mem == NULL);
-	assert(!rlist_empty(&range->frozen));
-	range->mem = rlist_shift_entry(&range->frozen,
-				       struct vy_mem, in_frozen);
+	assert(index->mem != NULL);
+	rlist_add_entry(&index->frozen, index->mem, in_frozen);
+	index->mem = NULL;
 }
 
 /**
- * Allocate a new active in-memory index for a range while moving
- * the old one to the frozen list. Used by dump/compaction in order
- * not to bother about synchronization with concurrent insertions
- * while a range is being dumped. If the active in-memory index is
- * empty, we don't need to dump it and therefore can delete it right
- * away.
+ * Allocate a new active in-memory index while moving the old one
+ * to the frozen list. Used by dump in order not to bother about
+ * synchronization with concurrent insertions while a mem is
+ * being dumped. If the active in-memory index is empty, we don't
+ * need to dump it and therefore can delete it right away.
  */
 static int
-vy_range_rotate_mem(struct vy_range *range)
+vy_index_rotate_mem(struct vy_index *index, struct lsregion *allocator,
+		    const int64_t *allocator_lsn)
 {
-	struct vy_index *index = range->index;
-	struct lsregion *allocator = &index->env->allocator;
-	const int64_t *allocator_lsn = &index->env->xm->lsn;
-	struct vy_mem *mem;
-
-	assert(range->mem != NULL);
-	mem = vy_mem_new(allocator, allocator_lsn,
-			 index->index_def, index->space_format,
-			 index->space_format_with_colmask,
-			 index->upsert_format);
+	assert(index->mem != NULL);
+	struct vy_mem *mem =
+		vy_mem_new(allocator, allocator_lsn, index->index_def,
+			   index->space_format,
+			   index->space_format_with_colmask,
+			   index->upsert_format);
 	if (mem == NULL)
 		return -1;
-	if (range->mem->used > 0)
-		vy_range_freeze_mem(range);
+	if (index->mem->used > 0)
+		vy_index_freeze_mem(index);
 	else
-		vy_mem_delete(range->mem);
-	range->mem = mem;
-	range->version++;
+		vy_mem_delete(index->mem);
+	index->mem = mem;
+	index->version++;
 	return 0;
 }
 
 /**
  * Delete frozen in-memory trees created at <= @dump_lsn and notify
- * the scheduler. Called after successful dump or compaction.
+ * the scheduler. Called after successfull index dump.
  */
 static void
-vy_range_dump_mems(struct vy_range *range, struct vy_scheduler *scheduler,
+vy_index_dump_mems(struct vy_index *index, struct vy_scheduler *scheduler,
 		   int64_t dump_lsn)
 {
 	struct vy_mem *mem, *tmp;
-
-	range->used = range->mem->used;
-	range->min_lsn = range->mem->min_lsn;
-	rlist_foreach_entry_safe(mem, &range->frozen, in_frozen, tmp) {
+	index->used = index->mem->used;
+	index->min_lsn = index->mem->min_lsn;
+	int version_inc = 0;
+	rlist_foreach_entry_safe(mem, &index->frozen, in_frozen, tmp) {
 		if (mem->min_lsn <= dump_lsn) {
+			index->stmt_count -= mem->tree.size;
 			rlist_del_entry(mem, in_frozen);
 			vy_scheduler_mem_dumped(scheduler, mem);
 			vy_mem_delete(mem);
+			version_inc = 1;
 		} else {
-			range->used += mem->used;
-			range->min_lsn = MIN(range->min_lsn, mem->min_lsn);
+			index->used += mem->used;
+			index->min_lsn = MIN(index->min_lsn, mem->min_lsn);
 		}
 	}
+	index->version += version_inc;
 }
 
 static void
@@ -3027,15 +3058,6 @@ vy_range_delete(struct vy_range *range)
 						       struct vy_run, in_range);
 		vy_run_unref(run);
 	}
-	/* Delete all mems. */
-	if (range->mem != NULL)
-		vy_mem_delete(range->mem);
-	while (!rlist_empty(&range->frozen)) {
-		struct vy_mem *mem;
-		mem = rlist_shift_entry(&range->frozen,
-					struct vy_mem, in_frozen);
-		vy_mem_delete(mem);
-	}
 
 	TRASH(range);
 	free(range);
@@ -3056,17 +3078,18 @@ vy_range_delete(struct vy_range *range)
  * iterator is returned in @p_max_output_count.
  */
 static struct vy_write_iterator *
-vy_range_get_dump_iterator(struct vy_range *range, int64_t vlsn,
+vy_index_get_dump_iterator(struct vy_index *index, int64_t vlsn,
 			   int64_t dump_lsn, size_t *p_max_output_count)
 {
+	assert(index->infinirange->is_level_zero);
 	struct vy_write_iterator *wi;
 	struct vy_mem *mem;
 	*p_max_output_count = 0;
 
-	wi = vy_write_iterator_new(range->index, range->run_count == 0, vlsn);
+	wi = vy_write_iterator_new(index, index->run_count == 0, vlsn);
 	if (wi == NULL)
 		goto err_wi;
-	rlist_foreach_entry(mem, &range->frozen, in_frozen) {
+	rlist_foreach_entry(mem, &index->frozen, in_frozen) {
 		if (mem->min_lsn > dump_lsn)
 			continue;
 		if (vy_write_iterator_add_mem(wi, mem) != 0)
@@ -3085,47 +3108,53 @@ err_wi:
  * Create a write iterator to compact a range.
  * For @dump_lsn, @vlsn and @p_max_output_count @sa vy_range_get_dump_iterator.
  *
- * @run_count determines how many runs are added to the write
- * iterator. Set to @range->run_count for major compaction,
- * 0 < .. < @range->run_count for minor compaction, or 0 for
- * dump.
+ * @run_count determines how many range's own runs are added to
+ * the write iterator. Set to @range->run_count for major
+ * compaction, 0 < .. < @range->run_count for minor compaction.
+ * All level zero infiniruns also are added to compaction.
  */
 static struct vy_write_iterator *
 vy_range_get_compact_iterator(struct vy_range *range, int run_count,
-			      int64_t *max_compact_lsn_out,
+			      int64_t *compact_max_lsn_out,
 			      int64_t vlsn, bool is_last_level,
 			      size_t *p_max_output_count,
 			      struct tuple *compact_from)
 {
+	assert(run_count >= 0 && run_count <= range->run_count);
 	struct vy_write_iterator *wi;
 	struct vy_run *run;
-	struct vy_mem *mem;
-	int64_t max_compact_lsn = 0;
-	*p_max_output_count = 0;
+	struct vy_index *index = range->index;
+	*p_max_output_count = range->level_zero_max_statements_count;
+	int64_t compact_max_lsn = 0;
 
-	wi = vy_write_iterator_new(range->index, is_last_level, vlsn);
+	wi = vy_write_iterator_new(index, is_last_level, vlsn);
 	if (wi == NULL)
 		goto err_wi;
-	/*
-	 * Prepare for merge. Note, merge iterator requires newer
-	 * sources to be added first so mems are added before runs.
-	 */
-	rlist_foreach_entry(mem, &range->frozen, in_frozen) {
-		if (vy_write_iterator_add_mem(wi, mem) != 0)
-			goto err_wi_sub;
-		*p_max_output_count += mem->tree.size;
-	}
-	assert(run_count >= 0 && run_count <= range->run_count);
-	rlist_foreach_entry(run, &range->runs, in_range) {
-		if (run_count-- == 0)
+
+	/* First, add level zero runs. */
+	rlist_foreach_entry(run, &index->infinirange->runs, in_range) {
+		/* Already compacted infinirun. */
+		if (run->info.max_lsn <= range->max_used_lsn)
 			break;
 		if (vy_write_iterator_add_run(wi, run, compact_from,
 					      range->end) != 0)
 			goto err_wi_sub;
-		*p_max_output_count += run->info.keys;
-		max_compact_lsn = MAX(max_compact_lsn, run->info.max_lsn);
+		assert(compact_max_lsn == 0 ||
+		       compact_max_lsn > run->info.max_lsn);
+		compact_max_lsn = MAX(run->info.max_lsn, compact_max_lsn);
 	}
-	*max_compact_lsn_out = max_compact_lsn;
+
+	/* Second, add runs of other levels, if need. */
+	if (run_count > 0)
+		rlist_foreach_entry(run, &range->runs, in_range) {
+			if (run_count-- == 0)
+				break;
+			if (vy_write_iterator_add_run(wi, run, NULL, NULL) != 0)
+				goto err_wi_sub;
+			*p_max_output_count += run->info.keys;
+			assert(compact_max_lsn > run->info.max_lsn);
+		}
+	*compact_max_lsn_out = compact_max_lsn;
 	return wi;
 err_wi_sub:
 	vy_write_iterator_cleanup(wi);
@@ -3262,13 +3291,13 @@ vy_range_update_compact_priority(struct vy_range *range)
 	range->compact_priority = 0;
 
 	/* Total number of checked runs. */
-	uint32_t total_run_count = 0;
+	uint32_t total_run_count = range->level_zero_run_count;
 	/* The total size of runs checked so far. */
-	uint64_t total_size = 0;
+	uint64_t total_size = range->est_level_zero_size;
 	/* Estimated size of a compacted run, if compaction is scheduled. */
 	uint64_t est_new_run_size = 0;
 	/* The number of runs at the current level. */
-	uint32_t level_run_count = 0;
+	uint32_t level_run_count = range->level_zero_run_count;
 	/*
 	 * The target (perfect) size of a run at the current level.
 	 * For the first level, it's the maximal size of a dump.
@@ -3341,7 +3370,7 @@ vy_range_needs_coalesce(struct vy_range *range,
 	struct vy_range *it;
 
 	/* Size of the coalesced range. */
-	uint64_t total_size = range->size + range->used;
+	uint64_t total_size = range->size + range->est_level_zero_size;
 	/* Coalesce ranges until total_size > max_size. */
 	uint64_t max_size = index->index_def->opts.range_size / 2;
 
@@ -3356,7 +3385,7 @@ vy_range_needs_coalesce(struct vy_range *range,
 	for (it = vy_range_tree_next(&index->tree, range);
 	     it != NULL && !vy_range_is_scheduled(it);
 	     it = vy_range_tree_next(&index->tree, it)) {
-		uint64_t size = it->size + it->used;
+		uint64_t size = it->size + it->est_level_zero_size;
 		if (total_size + size > max_size)
 			break;
 		total_size += size;
@@ -3365,7 +3394,7 @@ vy_range_needs_coalesce(struct vy_range *range,
 	for (it = vy_range_tree_prev(&index->tree, range);
 	     it != NULL && !vy_range_is_scheduled(it);
 	     it = vy_range_tree_prev(&index->tree, it)) {
-		uint64_t size = it->size + it->used;
+		uint64_t size = it->size + it->est_level_zero_size;
 		if (total_size + size > max_size)
 			break;
 		total_size += size;
@@ -3412,27 +3441,32 @@ vy_index_create(struct vy_index *index)
 		return -1;
 	}
 
-	/* create initial range */
+	/* Create initial range for the range tree. */
 	struct vy_range *range = vy_range_new(index, -1, NULL, NULL);
 	if (unlikely(range == NULL))
 		return -1;
+	index->infinirange = vy_range_new(index, -1, NULL, NULL);
+	if (unlikely(index->infinirange == NULL)) {
+		vy_range_delete(range);
+		return -1;
+	}
+	index->infinirange->is_level_zero = true;
 	vy_index_add_range(index, range);
 	vy_max_lsn_heap_insert(&index->max_lsn_heap, &range->in_max_lsn);
 	vy_index_acct_range(index, range);
 	vy_scheduler_add_range(scheduler, range);
+	vy_scheduler_add_index(scheduler, index);
 
 	/*
 	 * Log change in metadata.
 	 */
 	vy_log_tx_begin();
-	vy_log_create_index(index_def->opts.lsn, index_def->iid,
-			    index_def->space_id, index_def->opts.path);
-	vy_log_insert_range(index->index_def->opts.lsn,
-			    range->id, NULL, NULL, true);
-	if (vy_log_tx_commit() < 0)
-		return -1;
-
-	return 0;
+	int64_t lsn = index_def->opts.lsn;
+	vy_log_create_index(lsn, index_def->iid, index_def->space_id,
+			    index_def->opts.path);
+	vy_log_insert_range(lsn, index->infinirange->id, NULL, NULL, true);
+	vy_log_insert_range(lsn, range->id, NULL, NULL, false);
+	return vy_log_tx_commit();
 }
 
 /**
@@ -3504,9 +3538,16 @@ vy_index_recovery_cb(const struct vy_log_record *record, void *cb_arg)
 			diag_set(ClientError, ER_VINYL, "invalid range");
 			return -1;
 		}
-		vy_index_add_range(index, range);
-		vy_max_lsn_heap_insert(&index->max_lsn_heap,
-				       &range->in_max_lsn);
+		if (! record->is_level_zero) {
+			vy_max_lsn_heap_insert(&index->max_lsn_heap,
+					       &range->in_max_lsn);
+			vy_index_add_range(index, range);
+		} else {
+			/* Index can have only one infinirange. */
+			assert(index->infinirange == NULL);
+			index->infinirange = range;
+			range->is_level_zero = true;
+		}
 		arg->range = range;
 		break;
 	case VY_LOG_INSERT_RUN:
@@ -3553,18 +3594,23 @@ vy_index_open_ex(struct vy_index *index)
 		vy_index_acct_range(index, range);
 		vy_scheduler_add_range(env->scheduler, range);
 	}
+	assert(index->infinirange != NULL);
+	struct vy_run *run;
+	rlist_foreach_entry(run, &index->infinirange->runs, in_range)
+		vy_index_acct_run(index, run);
 	if (range != NULL || prev->end != NULL) {
 		diag_set(ClientError, ER_VINYL, "range overlap or hole");
 		return -1;
 	}
+	vy_scheduler_add_index(env->scheduler, index);
 	return 0;
 }
 
 /*
- * Save a statement in the range's in-memory index. If the
+ * Save a statement in the index's in-memory index. If the
  * region_stmt is NULL and the statement successfully inserted
  * then the new lsregion statement is returned via @a region_stmt.
- * @param range Range to which the statement insert to.
+ * @param index Index to which the statement insert to.
  * @param stmt Statement, allocated on malloc().
  * @param region_stmt NULL or the same statement, allocated on
  *                    lsregion.
@@ -3572,16 +3618,15 @@ vy_index_open_ex(struct vy_index *index)
  * @retval -1 Memory error.
  */
 static int
-vy_range_set(struct vy_range *range, const struct tuple *stmt,
+vy_index_set(struct vy_index *index, const struct tuple *stmt,
 	     const struct tuple **region_stmt)
 {
 	assert(!vy_stmt_is_region_allocated(stmt));
 	assert(*region_stmt == NULL ||
 	       vy_stmt_is_region_allocated(*region_stmt));
-	struct vy_index *index = range->index;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 	struct lsregion *allocator = &index->env->allocator;
-	struct vy_mem *mem = range->mem;
+	struct vy_mem *mem = index->mem;
 	int64_t lsn = vy_stmt_lsn(stmt);
 
 	bool was_empty = (mem->used == 0);
@@ -3601,16 +3646,15 @@ vy_range_set(struct vy_range *range, const struct tuple *stmt,
 	if (was_empty)
 		vy_scheduler_mem_dirtied(scheduler, mem);
 
-	if (range->used == 0) {
-		range->min_lsn = lsn;
-		vy_scheduler_update_range(scheduler, range);
+	if (index->used == 0) {
+		index->min_lsn = lsn;
+		vy_scheduler_update_index(scheduler, index);
 	}
 
 	assert(mem->min_lsn <= lsn);
-	assert(range->min_lsn <= lsn);
+	assert(index->min_lsn <= lsn);
 
 	size_t size = tuple_size(stmt);
-	range->used += size;
 	index->used += size;
 	index->stmt_count++;
 
@@ -3621,21 +3665,23 @@ static void
 vy_index_squash_upserts(struct vy_index *index, struct tuple *stmt);
 
 static int
-vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
+vy_index_set_upsert(struct vy_index *index, struct tuple *stmt)
 {
 	assert(vy_stmt_type(stmt) == IPROTO_UPSERT);
 
-	struct vy_index *index = range->index;
 	struct vy_stat *stat = index->env->stat;
 	struct index_def *index_def = index->index_def;
-	struct vy_mem *mem = range->mem;
+	struct vy_mem *mem = index->mem;
 	const struct tuple *older;
 	int64_t lsn = vy_stmt_lsn(stmt);
 	older = vy_mem_older_lsn(mem, stmt);
 	const struct tuple *region_stmt = NULL;
-	if ((older != NULL && vy_stmt_type(older) != IPROTO_UPSERT) ||
-	    (older == NULL && range->shadow == NULL &&
-	     rlist_empty(&range->frozen) && range->run_count == 0)) {
+	/*
+	 * Infinirange can't be splitted and thus can't have
+	 * shadow range.
+	 */
+	assert(index->infinirange->shadow == NULL);
+	if (older != NULL && vy_stmt_type(older) != IPROTO_UPSERT) {
 		/*
 		 * Optimization:
 		 *
@@ -3669,7 +3715,7 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 		}
 		assert(older == NULL || upserted_lsn != vy_stmt_lsn(older));
 		assert(vy_stmt_type(upserted) == IPROTO_REPLACE);
-		int rc = vy_range_set(range, upserted, &region_stmt);
+		int rc = vy_index_set(index, upserted, &region_stmt);
 		tuple_unref(upserted);
 		if (rc < 0)
 			return -1;
@@ -3701,7 +3747,7 @@ vy_range_set_upsert(struct vy_range *range, struct tuple *stmt)
 			vy_stmt_set_n_upserts(stmt, VY_UPSERT_INF);
 		}
 	}
-	return vy_range_set(range, stmt, &region_stmt);
+	return vy_index_set(index, stmt, &region_stmt);
 }
 
 /*
@@ -3759,7 +3805,8 @@ vy_tx_write(struct vy_index *index, struct tuple *stmt,
 	assert(!vy_stmt_is_region_allocated(stmt));
 	assert(*region_stmt == NULL ||
 	       vy_stmt_is_region_allocated(*region_stmt));
-	struct vy_range *range = NULL;
+	struct lsregion *allocator = &index->env->allocator;
+	const int64_t *allocator_lsn = &index->env->xm->lsn;
 	/*
 	 * If we're recovering the WAL, it may happen so that this
 	 * particular run was dumped after the checkpoint, and we're
@@ -3771,9 +3818,7 @@ vy_tx_write(struct vy_index *index, struct tuple *stmt,
 		if (vy_stmt_is_committed(index, stmt))
 			return 0;
 	}
-	/* Match range. */
-	range = vy_range_tree_find_by_key(&index->tree, ITER_EQ,
-					  index->index_def, stmt);
+	struct vy_mem *mem = index->mem;
 	/*
 	 * Allocate a new in-memory tree if either of the following
 	 * conditions is true:
@@ -3787,18 +3832,18 @@ vy_tx_write(struct vy_index *index, struct tuple *stmt,
 	 *   We have to seal the tree, because we don't support mixing
 	 *   statements of different formats in the same tree.
 	 */
-	if (unlikely(range->mem->min_lsn <= checkpoint_lsn ||
-		     range->mem->sc_version != sc_version)) {
-		if (vy_range_rotate_mem(range) != 0)
-			return -1;
-	}
+	if (unlikely(mem->min_lsn <= checkpoint_lsn ||
+		     mem->sc_version != sc_version &&
+		     vy_index_rotate_mem(index, allocator, allocator_lsn) != 0))
+		return -1;
+
 	int rc;
 	switch (vy_stmt_type(stmt)) {
 	case IPROTO_UPSERT:
-		rc = vy_range_set_upsert(range, stmt);
+		rc = vy_index_set_upsert(index, stmt);
 		break;
 	default:
-		rc = vy_range_set(range, stmt, region_stmt);
+		rc = vy_index_set(index, stmt, region_stmt);
 		break;
 	}
 	/*
@@ -3878,10 +3923,12 @@ struct vy_task {
 	double bloom_fpr;
 	/** Max written key. */
 	char *max_written_key;
+	/** Left border for infiniruns. */
+	struct tuple *compact_from;
 	/** Count of ranges to compact. */
 	int run_count;
 	/** Maximal LSN of compacted runs. */
-	int64_t max_compact_lsn;
+	int64_t compact_max_lsn;
 };
 
 /**
@@ -3927,13 +3974,13 @@ vy_task_dump_execute(struct vy_task *task)
 	struct vy_write_iterator *wi = task->wi;
 	struct tuple *stmt;
 	assert(range->is_level_zero);
+	assert(range == task->index->infinirange);
 
-	/* The range has been deleted from the scheduler queues. */
-	assert(range->in_dump.pos == UINT32_MAX);
-	assert(range->in_compact.pos == UINT32_MAX);
 	const char **max_key = NULL;
 	if (range->is_level_zero)
 		max_key = (const char **) &task->max_written_key;
+	/* The index has been deleted from the scheduler queues. */
+	assert(vy_index_is_scheduled(task->index));
 
 	/* Start iteration. */
 	if (vy_write_iterator_next(wi, &stmt) != 0 ||
@@ -3954,43 +4001,144 @@ vy_task_dump_complete(struct vy_task *task)
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 	assert(range->is_level_zero);
-	struct vy_scheduler *scheduler = index->env->scheduler;
+	assert(range == index->infinirange);
+	struct vy_env *e = index->env;
+	struct vy_scheduler *scheduler = e->scheduler;
+	struct vy_run *new_run = range->new_run;
+	bool is_empty = false;
 
 	/*
 	 * Log change in metadata.
 	 */
-	if (!vy_run_is_empty(range->new_run)) {
+	if (!vy_run_is_empty(new_run)) {
 		vy_log_tx_begin();
-		vy_log_insert_run(range->id, range->new_run->id);
+		vy_log_insert_run(range->id, new_run->id);
 		if (vy_log_tx_commit() < 0)
 			return -1;
-	} else
+	} else {
 		vy_range_discard_new_run(range);
+		is_empty = true;
+	}
 
-	say_info("%s: completed dumping range %s",
-		 index->name, vy_range_str(range));
+	say_info("%s: completed dumping infinirange", index->name);
 
 	/* The iterator has been cleaned up in a worker thread. */
 	vy_write_iterator_delete(task->wi);
 
-	vy_index_unacct_range(index, range);
-	vy_range_dump_mems(range, scheduler, task->dump_lsn);
-	if (range->new_run != NULL) {
-		range->max_dump_size = MAX(range->max_dump_size,
-					   vy_run_size(range->new_run));
-		vy_range_add_run(range, range->new_run);
-		vy_range_update_compact_priority(range);
-		assert(range->new_run->info.max_lsn >= range->compact_max_lsn);
-		/* New runs always have higher LSN. */
-		range->compact_max_lsn = range->new_run->info.max_lsn;
-		vy_max_lsn_heap_update(&index->max_lsn_heap,
-				       &range->in_max_lsn);
+	/* Recalculate in-memory space used. */
+	vy_index_dump_mems(index, scheduler, task->dump_lsn);
+	if (new_run != NULL) {
+		vy_range_add_run(range, new_run);
+		vy_index_acct_run(index, new_run);
 		range->new_run = NULL;
 		assert(! range->is_level_zero || task->max_written_key != NULL);
 	}
 	range->version++;
-	vy_index_acct_range(index, range);
-	vy_scheduler_add_range(scheduler, range);
+	vy_scheduler_add_index(scheduler, index);
+	vy_index_info_ranges(index);
+	if (is_empty)
+		return 0;
+
+	say_info("%s: updating compact priorities of ranges", index->name);
+
+	struct vy_page_info *page = new_run->info.page_infos;
+	assert(new_run->info.count >= 1);
+	assert(task->max_key != NULL);
+	struct vy_page_info *next = new_run->info.count > 1 ? (page + 1) : NULL;
+	const char *next_page_begin =
+		next != NULL ? next->min_key : task->max_key;
+	assert(next_page_begin != NULL);
+
+	/* Find the first range. */
+	struct vy_range *range = vy_range_tree_first(&index->tree);
+	while (range->end != NULL &&
+	       key_compare(range->end, next_page_begin, index->key_def) < 0)
+	{
+		vy_range_tree_next(&index->tree, &range);
+	}
+
+	/* Estimated size of the new run of the range. */
+	uint64_t curr_range_est_dump_size = page->size;
+	/* Estimated statements count, dumped in the range. */
+	uint32_t curr_range_est_dumped_statements = page->count;
+	int page_i = 0;
+	while(true) {
+		/**
+		 * In the first 'if' we iterate over pages.
+		 * In the second one we iterate over ranges, when
+		 * the next page is out of the current range.
+		 */
+		if (range->end == NULL ||
+		    key_compare(range->end, next_page_begin,
+				index->key_def) >= 0) {
+			/**
+			 * First case, the next page begins in the
+			 * current range.
+			 *   ------------+------------
+			 *  ...   page   | next page ...
+			 *   ------------+------------
+			 *   -------------------------
+			 *  ...      range           ...
+			 *   -------------------------
+			 */
+			page = next;
+			++page_i;
+			next = new_run->info.count > page_i ? (page + 1) : NULL;
+			if (next != NULL) {
+				next_page_begin = next->min_key;
+				curr_range_est_dump_size += next->size;
+				curr_range_est_dumped_statements += next->count;
+			} else {
+				next_page_begin = task->max_key;
+			}
+			continue;
+		} else {
+			/**
+			 * Second case, the next page begins in
+			 * the next range. Or there are no more
+			 * pages. In both case, firstly need to
+			 * update the current range.
+			 *   ----------------+- - - - - -
+			 *  ...     page     | next page ...
+			 *   ----------------+- - - - - -
+			 *   ---------+---+-----------
+			 *  ... range |...| next range   ...
+			 *   ---------+---+-----------
+			 */
+			range->max_dump_size = MAX(range->max_dump_size,
+						   curr_range_est_dump_size);
+			range->level_zero_run_count++;
+			range->est_level_zero_size += curr_range_est_dump_size;
+			range->level_zero_max_statements_count +=
+				curr_range_est_dumped_statements;
+			if (vy_range_waits_for_task(range)) {
+				vy_range_update_compact_priority(range);
+				vy_scheduler_update_range(range);
+			}
+
+			/* No more pages. */
+			if (next == NULL)
+				break;
+			/*
+			 * Between the current range and the next
+			 * range can be some other ranges.
+			 * Skip them.
+			 */
+			do {
+				vy_range_tree_next(&index->tree, range);
+				/*
+				 * Previos range->end != NULL, so
+				 * there is at least one more
+				 * range - [..., +inf].
+				 */
+				assert(range != NULL);
+			} while (range->end != NULL &&
+				 key_compare(range->end, next_page_begin,
+					     index->key_def) < 0);
+			curr_range_est_dump_size = next->size;
+			curr_range_est_dumped_statements = next->count;
+		}
+	}
 	return 0;
 }
 
@@ -4000,16 +4148,16 @@ vy_task_dump_abort(struct vy_task *task, bool in_shutdown)
 	struct vy_index *index = task->index;
 	struct vy_range *range = task->range;
 	assert(range->is_level_zero);
+	assert(range == index->infinirange);
 
 	/* The iterator has been cleaned up in a worker thread. */
 	vy_write_iterator_delete(task->wi);
 
 	if (!in_shutdown && !index->is_dropped) {
-		say_error("%s: failed to dump range %s: %s",
-			  index->name, vy_range_str(range),
+		say_error("%s: failed to dump infinirange: %s", index->name,
 			  diag_last_error(&task->diag)->errmsg);
 		vy_range_discard_new_run(range);
-		vy_scheduler_add_range(index->env->scheduler, range);
+		vy_scheduler_add_index(index->env->scheduler, index);
 	}
 
 	/*
@@ -4028,9 +4176,10 @@ vy_task_coalesce_new(struct mempool *pool, struct vy_range *first,
  * @min_lsn <= @dump_lsn.
  */
 static int
-vy_task_dump_new(struct mempool *pool, struct vy_range *range,
+vy_task_dump_new(struct mempool *pool, struct vy_index *index,
 		 int64_t dump_lsn, struct vy_task **p_task)
 {
+	struct vy_range *range = index->infinirange;
 	assert(range->is_level_zero);
 	static struct vy_task_ops dump_ops = {
 		.execute = vy_task_dump_execute,
@@ -4038,18 +4187,14 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range,
 		.abort = vy_task_dump_abort,
 	};
 
-	struct vy_index *index = range->index;
 	struct tx_manager *xm = index->env->xm;
+	struct lsregion *allocator = &index->env->allocator;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 
 	if (index->is_dropped) {
-		vy_scheduler_remove_range(scheduler, range);
+		vy_scheduler_remove_index(scheduler, index);
 		return 0;
 	}
-
-	struct vy_range *first, *last;
-	if (vy_range_needs_coalesce(range, &first, &last))
-		return vy_task_coalesce_new(pool, first, last, p_task);
 
 	struct vy_task *task = vy_task_new(pool, index, &dump_ops);
 	if (task == NULL)
@@ -4058,11 +4203,11 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range,
 	if (vy_range_prepare_new_run(range) != 0)
 		goto err_run;
 
-	if (vy_range_rotate_mem(range) != 0)
+	if (vy_index_rotate_mem(index, allocator, &xm->lsn) != 0)
 		goto err_mem;
 
 	struct vy_write_iterator *wi;
-	wi = vy_range_get_dump_iterator(range, tx_manager_vlsn(xm), dump_lsn,
+	wi = vy_index_get_dump_iterator(index, tx_manager_vlsn(xm), dump_lsn,
 					&task->max_output_count);
 	if (wi == NULL)
 		goto err_wi;
@@ -4072,10 +4217,9 @@ vy_task_dump_new(struct mempool *pool, struct vy_range *range,
 	task->dump_lsn = MIN(xm->lsn, dump_lsn);
 	task->bloom_fpr = index->env->conf->bloom_fpr;
 
-	vy_scheduler_remove_range(scheduler, range);
+	vy_scheduler_remove_index(scheduler, index);
 
-	say_info("%s: started dumping range %s",
-		 index->name, vy_range_str(range));
+	say_info("%s: started dumping infinirange", index->name);
 	*p_task = task;
 	return 0;
 err_wi:
@@ -4085,8 +4229,8 @@ err_mem:
 err_run:
 	vy_task_delete(pool, task);
 err_task:
-	say_error("%s: can't start range dump %s: %s", index->name,
-		  vy_range_str(range), diag_last_error(diag_get())->errmsg);
+	say_error("%s: can't start infinirange dump: %s", index->name,
+		  diag_last_error(diag_get())->errmsg);
 	return -1;
 }
 
@@ -4100,8 +4244,8 @@ vy_task_split_execute(struct vy_task *task)
 	uint64_t unused;
 
 	/* The range has been deleted from the scheduler queues. */
-	assert(range->in_dump.pos == UINT32_MAX);
-	assert(range->in_compact.pos == UINT32_MAX);
+	assert(vy_range_is_scheduled(range));
+	assert(! range->is_level_zero);
 
 	/* Start iteration. */
 	if (vy_write_iterator_next(wi, &stmt) != 0)
@@ -4134,7 +4278,6 @@ vy_task_split_complete(struct vy_task *task)
 	struct vy_range *range = task->range;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 	struct vy_range *r, *tmp;
-	struct vy_mem *mem;
 
 	/*
 	 * Log change in metadata.
@@ -4143,7 +4286,7 @@ vy_task_split_complete(struct vy_task *task)
 	vy_log_delete_range(range->id);
 	rlist_foreach_entry(r, &range->split_list, split_list) {
 		vy_log_insert_range(index->index_def->opts.lsn, r->id,
-				    r->begin, r->end, r->is_level_zero);
+				     r->begin, r->end, false);
 		if (!vy_run_is_empty(r->new_run))
 			vy_log_insert_run(r->id, r->new_run->id);
 	}
@@ -4168,6 +4311,7 @@ vy_task_split_complete(struct vy_task *task)
 	 * the latter.
 	 */
 	vy_index_unacct_range(index, range);
+	vy_max_lsn_heap_delete(&index->max_lsn_heap, &range->in_max_lsn);
 	rlist_foreach_entry_safe(r, &range->split_list, split_list, tmp) {
 		/*
 		 * Add the new run created by split to the list
@@ -4190,9 +4334,8 @@ vy_task_split_complete(struct vy_task *task)
 			 * For example, if there were mems with
 			 * new keys.
 			 */
-			r->compact_max_lsn = MAX(r->compact_max_lsn,
-						 r->new_run->info.max_lsn);
-			vy_max_lsn_heap_update(&index->max_lsn_heap,
+			r->compact_max_lsn = task->compact_max_lsn;
+			vy_max_lsn_heap_insert(&index->max_lsn_heap,
 					       &r->in_max_lsn);
 			r->new_run = NULL;
 		}
@@ -4205,13 +4348,8 @@ vy_task_split_complete(struct vy_task *task)
 		vy_scheduler_add_range(scheduler, r);
 	}
 	index->version++;
-
-	/* Notify the scheduler that the range was dumped. */
-	assert(range->mem == NULL); /* active mem was frozen */
-	rlist_foreach_entry(mem, &range->frozen, in_frozen)
-		vy_scheduler_mem_dumped(scheduler, mem);
-
 	vy_range_delete(range);
+	vy_index_info_ranges(index);
 	return 0;
 }
 
@@ -4231,37 +4369,31 @@ vy_task_split_abort(struct vy_task *task, bool in_shutdown)
 			  diag_last_error(&task->diag)->errmsg);
 		rlist_foreach_entry(r, &range->split_list, split_list)
 			vy_range_discard_new_run(r);
-		vy_scheduler_add_range(index->env->scheduler, range);
 	}
 
-	/*
-	 * On split failure we delete new ranges, but leave their
-	 * mems and runs linked to the old range so that statements
-	 * inserted while split was in progress don't get lost.
-	 */
+	uint64_t max_dump_size = 0;
 	rlist_foreach_entry_safe(r, &range->split_list, split_list, tmp) {
 		assert(r->run_count == 0);
-
-		vy_range_freeze_mem(r);
-		rlist_splice(&range->frozen, &r->frozen);
-		if (range->used == 0)
-			range->min_lsn = r->min_lsn;
-		assert(range->min_lsn <= r->min_lsn);
-		range->used += r->used;
 
 		rlist_del(&r->split_list);
 		assert(r->shadow == range);
 		r->shadow = NULL;
 
-		vy_max_lsn_heap_delete(&index->max_lsn_heap, &r->in_max_lsn);
 		vy_index_remove_range(index, r);
+		max_dump_size += r->max_dump_size;
+		range->level_zero_run_count += r->level_zero_run_count;
+		range->est_level_zero_size += r->est_level_zero_size;
+		range->level_zero_max_statements_count +=
+			r->level_zero_max_statements_count;
 		vy_range_delete(r);
 	}
-	vy_range_unfreeze_mem(range);
+	range->max_dump_size = MAX(range->max_dump_size, max_dump_size);
+	vy_range_update_compact_priority(range);
+	if (!in_shutdown && !index->is_dropped)
+		vy_scheduler_add_range(index->env->scheduler, range);
 
 	/* Insert the range back into the tree. */
 	vy_index_add_range(index, range);
-	vy_max_lsn_heap_insert(&index->max_lsn_heap, &range->in_max_lsn);
 	index->version++;
 }
 
@@ -4305,12 +4437,10 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 			goto err_parts;
 	}
 
-	vy_range_freeze_mem(range);
-
 	struct vy_write_iterator *wi;
 	task->run_count = range->run_count;
 	wi = vy_range_get_compact_iterator(range, task->run_count,
-					   &task->max_compact_lsn,
+					   &task->compact_max_lsn,
 					   tx_manager_vlsn(xm), true,
 					   &task->max_output_count,
 					   NULL);
@@ -4319,7 +4449,6 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 
 	/* Replace the old range with the new ones. */
 	vy_index_remove_range(index, range);
-	vy_max_lsn_heap_delete(&index->max_lsn_heap, &range->in_max_lsn);
 	for (int i = 0; i < n_parts; i++) {
 		struct vy_range *r = parts[i];
 		/*
@@ -4332,8 +4461,6 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 		rlist_add_tail(&range->split_list, &r->split_list);
 		assert(r->shadow == NULL);
 		r->shadow = range;
-		r->compact_max_lsn = range->compact_max_lsn;
-		vy_max_lsn_heap_insert(&index->max_lsn_heap, &r->in_max_lsn);
 		vy_index_add_range(index, r);
 	}
 
@@ -4352,7 +4479,7 @@ vy_task_split_new(struct mempool *pool, struct vy_range *range,
 	*p_task = task;
 	return 0;
 err_wi:
-	vy_range_unfreeze_mem(range);
+	/* Nothing to do. */
 err_parts:
 	for (int i = 0; i < n_parts; i++) {
 		struct vy_range *r = parts[i];
@@ -4378,8 +4505,8 @@ vy_task_compact_execute(struct vy_task *task)
 	uint64_t unused;
 
 	/* The range has been deleted from the scheduler queues. */
-	assert(range->in_dump.pos == UINT32_MAX);
-	assert(range->in_compact.pos == UINT32_MAX);
+	assert(vy_range_is_scheduled(range));
+	assert(! range->is_level_zero);
 
 	/* Start iteration. */
 	if (vy_write_iterator_next(wi, &stmt) != 0 ||
@@ -4497,8 +4624,10 @@ vy_task_coalesce_new(struct mempool *pool, struct vy_range *first,
 	};
 
 	struct vy_index *index = first->index;
-	struct tx_manager *xm = index->env->xm;
-	struct vy_scheduler *scheduler = index->env->scheduler;
+	struct vy_env *env = index->env;
+	struct tx_manager *xm = env->xm;
+	struct vy_scheduler *scheduler = env->scheduler;
+	struct vy_range *infinirange = index->infinirange;
 	struct vy_range *result = vy_range_new(index, -1, first->begin,
 					       last->end);
 	if (result == NULL)
@@ -4514,24 +4643,33 @@ vy_task_coalesce_new(struct mempool *pool, struct vy_range *first,
 	if (task == NULL)
 		goto err_task;
 
-	/* Add frozen mems. */
-	result->compact_max_lsn = INT64_MAX;
+	/* Add infiniruns. */
 	it = first;
 	while (it != end) {
 		vy_scheduler_remove_range(scheduler, it);
 		vy_range_rotate_mem(it);
-		struct vy_mem *mem;
-		rlist_foreach_entry(mem, &it->frozen, in_frozen) {
-			if (vy_write_iterator_add_mem(wi, mem) != 0)
+		struct vy_run *run;
+		rlist_foreach_entry(run, infinirange->runs, in_range) {
+			if (run->info.max_lsn <= it->compact_max_lsn)
+				continue;
+			struct tuple *begin =
+				vy_key_from_msgpack(env->key_format,
+						    range->begin);
+			if (begin == NULL)
 				goto err_wi_sub;
-			task->max_output_count += mem->tree.size;
+			int rc = vy_write_iterator_add_run(wi, run, it->end,
+							   begin);
+			tuple_unref(begin);
+			if (rc != 0)
+				goto err_wi_sub;
 		}
 		rlist_add_entry(&result->split_list, it, split_list);
+		task->max_output_count += it->level_zero_max_statements_count;
 		it = vy_range_tree_next(&index->tree, it);
 	}
 
-	/* Add runs. */
-	task->max_compact_lsn = 0;
+	/* Add own runs. */
+	task->compact_max_lsn = 0;
 	rlist_foreach_entry(it, &result->split_list, split_list) {
 		assert(vy_range_is_scheduled(it));
 		struct vy_run *run;
@@ -4539,13 +4677,13 @@ vy_task_coalesce_new(struct mempool *pool, struct vy_range *first,
 			if (vy_write_iterator_add_run(wi, run, NULL, NULL) != 0)
 				goto err_wi_sub;
 			task->max_output_count += run->info.keys;
-			task->max_compact_lsn = MAX(task->max_compact_lsn,
+			task->compact_max_lsn = MAX(task->compact_max_lsn,
 						    run->info.max_lsn);
 		}
 	}
 	task->wi = wi;
 	task->range = result;
-	task->bloom_fpr = index->env->conf->bloom_fpr;
+	task->bloom_fpr = env->conf->bloom_fpr;
 	task->dump_lsn = xm->lsn;
 	*p_task = task;
 	say_info("%s: started coalesce ranges from %s to %s", index->name,
@@ -4557,7 +4695,8 @@ err_wi_sub:
 	/* Schedule all removed ranges back. */
 	it = first;
 	while (it != end) {
-		vy_scheduler_add_range(scheduler, it);
+		if (vy_range_is_scheduled(it))
+			vy_scheduler_add_range(scheduler, it);
 		it = vy_range_tree_next(&index->tree, it);
 	}
 err_task:
@@ -4579,6 +4718,7 @@ vy_task_compact_complete(struct vy_task *task)
 	struct vy_range *range = task->range;
 	struct vy_scheduler *scheduler = index->env->scheduler;
 	struct vy_run *run, *tmp;
+	assert(! range->is_level_zero);
 	int n;
 
 	/*
@@ -4607,10 +4747,9 @@ vy_task_compact_complete(struct vy_task *task)
 	vy_write_iterator_delete(task->wi);
 
 	/*
-	 * Replace compacted mems and runs with the resulting run.
+	 * Replace compacted runs with the resulting run.
 	 */
 	vy_index_unacct_range(index, range);
-	vy_range_dump_mems(range, scheduler, task->dump_lsn);
 	n = task->run_count;
 	rlist_foreach_entry_safe(run, &range->runs, in_range, tmp) {
 		vy_range_remove_run(range, run);
@@ -4619,19 +4758,41 @@ vy_task_compact_complete(struct vy_task *task)
 			break;
 	}
 	assert(n == 0);
+	range->compact_max_lsn = MAX(range->compact_max_lsn,
+				     task->compact_max_lsn);
 	if (range->new_run != NULL) {
 		vy_range_add_run(range, range->new_run);
+		assert(range->compact_max_lsn >= range->new_run->info.max_lsn);
 		/* @sa comment in the vy_task_split_complete(). */
-		range->compact_max_lsn = MAX(range->compact_max_lsn,
-					     range->new_run->info.max_lsn);
-		vy_max_lsn_heap_update(&index->max_lsn_heap,
-				       &range->in_max_lsn);
 		range->new_run = NULL;
 	}
 	range->n_compactions++;
 	range->version++;
+	vy_max_lsn_heap_update(&index->max_lsn_heap, &range->in_max_lsn);
 	vy_index_acct_range(index, range);
 	vy_scheduler_add_range(scheduler, range);
+
+	/* Try to delete the fully compacted infiniruns. */
+	int64_t purge_max_used_lsn =
+		vy_max_used_lsn_heap_top(&index->max_used_lsn_heap);
+
+	struct vy_range *infinirange = index->infinirange;
+	struct vy_run *oldest_infinirun =
+		rlist_last_entry(&infinirange->runs, struct vy_range, in_range);
+	vy_log_tx_begin();
+	while (oldest_infinirun->max_lsn <= purge_max_used_lsn) {
+		vy_log_delete_run(oldest_infinirun->id);
+		vy_range_remove_run(infinirange, oldest_infinirun);
+		vy_run_unref(oldest_infinirun);
+		if (rlist_empty(&infinirange->runs))
+			break;
+		oldest_infinirun = rlist_last_entry(&infinirange->runs,
+						    struct vy_range, in_range)
+	}
+	if (vy_log_tx_commit() != 0)
+		say_warn("%s: failed to delete unused infiniruns", index->name);
+
+	vy_index_info_ranges(index);
 	return 0;
 }
 
@@ -4646,6 +4807,10 @@ vy_task_compact_abort(struct vy_task *task, bool in_shutdown)
 	/* Restore the max dump size and compact priority. */
 	range->max_dump_size = MAX(range->saved_max_dump_size,
 				   range->max_dump_size);
+	range->est_level_zero_size += range->saved_est_level_zero_size;
+	range->level_zero_run_count += range->saved_level_zero_run_count;
+	range->level_zero_max_statements_count +=
+		range->saved_level_zero_max_statements_count;
 	vy_range_update_compact_priority(range);
 
 	if (!in_shutdown && !index->is_dropped) {
@@ -4667,6 +4832,7 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 		    struct vy_task **p_task)
 {
 	assert(range->compact_priority > 0);
+	assert(! range->is_level_zero);
 
 	static struct vy_task_ops compact_ops = {
 		.execute = vy_task_compact_execute,
@@ -4675,8 +4841,9 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 	};
 
 	struct vy_index *index = range->index;
-	struct tx_manager *xm = index->env->xm;
-	struct vy_scheduler *scheduler = index->env->scheduler;
+	struct vy_env *env = index->env;
+	struct tx_manager *xm = env->xm;
+	struct vy_scheduler *scheduler = env->scheduler;
 
 	if (index->is_dropped) {
 		vy_scheduler_remove_range(scheduler, range);
@@ -4699,28 +4866,46 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 	if (vy_range_prepare_new_run(range) != 0)
 		goto err_run;
 
-	if (vy_range_rotate_mem(range) != 0)
-		goto err_mem;
-
 	struct vy_write_iterator *wi;
-	bool is_last_level = range->compact_priority == range->run_count;
-	task->run_count = range->compact_priority;
+	bool is_last_level = range->compact_priority == (range->run_count +
+			     range->level_zero_run_count);
+	if (range->begin != NULL) {
+		task->compact_from = vy_key_from_msgpack(env->key_format,
+							 range->begin);
+		if (task->compact_from == NULL)
+			goto err_wi;
+	}
+	/** Count of own runs of the range (not infiniruns). */
+	task->run_count = range->compact_priority - range->level_zero_run_count;
 	wi = vy_range_get_compact_iterator(range, task->run_count,
-					   &task->max_compact_lsn,
+					   &task->compact_max_lsn,
 					   tx_manager_vlsn(xm), is_last_level,
 					   &task->max_output_count,
-					   NULL);
-	if (wi == NULL)
+					   task->compact_from);
+	if (wi == NULL) {
+		if (task->compact_from != NULL)
+			tuple_unref(task->compact_from);
+		task->compact_from = NULL;
 		goto err_wi;
+	}
 
 	task->range = range;
 	task->wi = wi;
 	task->dump_lsn = xm->lsn;
 	task->bloom_fpr = index->env->conf->bloom_fpr;
 	task->run_count = range->compact_priority;
+	task->bloom_fpr = env->conf->bloom_fpr;
 	range->saved_max_dump_size = range->max_dump_size;
+	range->saved_est_level_zero_size = range->est_level_zero_size;
+	range->saved_level_zero_run_count = range->level_zero_run_count;
+	range->saved_level_zero_max_statements_count =
+		range->level_zero_max_statements_count;
+
 	range->max_dump_size = 0;
 	range->compact_priority = 0;
+	range->est_level_zero_size = 0;
+	range->level_zero_run_count = 0;
+	range->level_zero_max_statements_count = 0;
 
 	vy_scheduler_remove_range(scheduler, range);
 
@@ -4730,8 +4915,6 @@ vy_task_compact_new(struct mempool *pool, struct vy_range *range,
 	*p_task = task;
 	return 0;
 err_wi:
-	/* Leave the new mem on the list in case of failure. */
-err_mem:
 	vy_range_discard_new_run(range);
 err_run:
 	vy_task_delete(pool, task);
@@ -4750,8 +4933,8 @@ err_task:
 static bool
 heap_dump_less(struct heap_node *a, struct heap_node *b)
 {
-	struct vy_range *left = container_of(a, struct vy_range, in_dump);
-	struct vy_range *right = container_of(b, struct vy_range, in_dump);
+	struct vy_index *left = container_of(a, struct vy_index, in_dump);
+	struct vy_index *right = container_of(b, struct vy_index, in_dump);
 
 	/* Older ranges are dumped first. */
 	return left->min_lsn < right->min_lsn;
@@ -4954,31 +5137,54 @@ static void
 vy_scheduler_add_range(struct vy_scheduler *scheduler,
 		       struct vy_range *range)
 {
-	vy_dump_heap_insert(&scheduler->dump_heap, &range->in_dump);
+	assert(vy_range_is_scheduled(range));
 	vy_compact_heap_insert(&scheduler->compact_heap, &range->in_compact);
-	assert(range->in_dump.pos != UINT32_MAX);
 	assert(range->in_compact.pos != UINT32_MAX);
+}
+
+static void
+vy_scheduler_add_index(struct vy_scheduler *scheduler, struct vy_index *index)
+{
+	assert(vy_index_is_scheduled(index));
+	vy_dump_heap_insert(&scheduler->dump_heap, &index->in_dump);
+	assert(! vy_index_is_scheduled(index));
+}
+
+static void
+vy_scheduler_update_index(struct vy_scheduler *scheduler,
+                         struct vy_index *index)
+{
+	if (vy_index_is_scheduled(index))
+		return; /* Index is being processed by a task */
+
+	vy_dump_heap_update(&scheduler->dump_heap, &index->in_dump);
+	assert(! vy_index_is_scheduled(index));
+}
+
+static void
+vy_scheduler_remove_index(struct vy_scheduler *scheduler,
+			  struct vy_index *index)
+{
+	vy_dump_heap_delete(&scheduler->dump_heap, &index->in_dump);
+	index->in_dump.pos = UINT32_MAX;
 }
 
 static void
 vy_scheduler_update_range(struct vy_scheduler *scheduler,
 			  struct vy_range *range)
 {
-	if (range->in_dump.pos == UINT32_MAX)
+	if (range->in_compact.pos == UINT32_MAX)
 		return; /* range is being processed by a task */
 
-	vy_dump_heap_update(&scheduler->dump_heap, &range->in_dump);
-	assert(range->in_dump.pos != UINT32_MAX);
-	assert(range->in_compact.pos != UINT32_MAX);
+	vy_compact_heap_update(&scheduler->compact_heap, &range->in_compact);
+	assert(! vy_range_is_scheduled(range));
 }
 
 static void
 vy_scheduler_remove_range(struct vy_scheduler *scheduler,
 			  struct vy_range *range)
 {
-	vy_dump_heap_delete(&scheduler->dump_heap, &range->in_dump);
 	vy_compact_heap_delete(&scheduler->compact_heap, &range->in_compact);
-	range->in_dump.pos = UINT32_MAX;
 	range->in_compact.pos = UINT32_MAX;
 }
 
@@ -5002,8 +5208,8 @@ retry:
 	struct heap_node *pn = vy_dump_heap_top(&scheduler->dump_heap);
 	if (pn == NULL)
 		return 0; /* nothing to do */
-	struct vy_range *range = container_of(pn, struct vy_range, in_dump);
-	if (range->used == 0)
+	struct vy_index *index = container_of(pn, struct vy_index, in_dump);
+	if (index->used == 0)
 		return 0; /* nothing to do */
 	int64_t dump_lsn = INT64_MAX;
 	if (scheduler->checkpoint_lsn != -1) {
@@ -5013,14 +5219,14 @@ retry:
 		 * the WAL checkpoint.
 		 */
 		dump_lsn = scheduler->checkpoint_lsn;
-		if (range->min_lsn > dump_lsn)
+		if (index->min_lsn > dump_lsn)
 			return 0;
 	} else {
 		if (!vy_quota_is_exceeded(&scheduler->env->quota))
 			return 0; /* nothing to do */
 	}
-	if (vy_task_dump_new(&scheduler->task_pool,
-			     range, dump_lsn, ptask) != 0)
+	if (vy_task_dump_new(&scheduler->task_pool, index, dump_lsn,
+			     ptask) != 0)
 		return -1;
 	if (*ptask == NULL)
 		goto retry; /* index dropped */
@@ -5840,6 +6046,8 @@ vy_index_drop(struct vy_index *index)
 	index->is_dropped = true;
 	rlist_del(&index->link);
 	index->space = NULL;
+	if (! vy_index_is_scheduled(index))
+		vy_scheduler_remove_index(env->scheduler, index);
 	vy_index_unref(index);
 
 	/*
@@ -5908,6 +6116,8 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	     struct space *space)
 {
 	assert(space != NULL);
+	struct lsregion *allocator = &e->allocator;
+	const int64_t *allocator_lsn = &e->xm->lsn;
 	static int64_t run_buckets[] = {
 		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 50, 100,
 	};
@@ -5926,6 +6136,7 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 		return NULL;
 	}
 	index->env = e;
+	index->min_lsn = INT64_MAX;
 
 	/* Original user defined index_def. */
 	user_index_def = index_def_dup(user_index_def);
@@ -5996,9 +6207,16 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	if (index->cache == NULL)
 		goto fail_cache_init;
 
+	index->mem = vy_mem_new(allocator, allocator_lsn, user_key_def,
+				space->format, index->space_format_with_colmask,
+				index->upsert_format);
+	if (index->mem == NULL)
+		goto fail_mem;
+
 	vy_range_tree_new(&index->tree);
 	index->version = 1;
 	rlist_create(&index->link);
+	rlist_create(&index->frozen);
 	read_set_new(&index->read_set);
 	index->space = space;
 	index->user_index_def = user_index_def;
@@ -6006,9 +6224,11 @@ vy_index_new(struct vy_env *e, struct index_def *user_index_def,
 	tuple_format_ref(index->space_format, 1);
 	index->space_index_count = space->index_count;
 	vy_max_lsn_heap_create(&index->max_lsn_heap);
-
+	index->in_dump.pos = UINT32_MAX;
 	return index;
 
+fail_mem:
+	vy_cache_delete(index->cache);
 fail_cache_init:
 	histogram_delete(index->run_hist);
 fail_run_hist:
@@ -6099,6 +6319,24 @@ vy_index_delete(struct vy_index *index)
 	vy_max_lsn_heap_destroy(&index->max_lsn_heap);
 	read_set_iter(&index->read_set, NULL, read_set_delete_cb, NULL);
 	vy_range_tree_iter(&index->tree, NULL, vy_range_tree_free_cb, index);
+	/*
+	 * Exempt the index along with all its in-memory indexes
+	 * from the scheduler.
+	 */
+	struct vy_scheduler *scheduler = index->env->scheduler;
+	if (index->mem != NULL) {
+		vy_scheduler_mem_dumped(scheduler, index->mem);
+		vy_mem_delete(index->mem);
+	}
+	while (!rlist_empty(&index->frozen)) {
+		struct vy_mem *mem;
+		mem = rlist_shift_entry(&index->frozen,
+					struct vy_mem, in_frozen);
+		vy_scheduler_mem_dumped(scheduler, mem);
+		vy_mem_delete(mem);
+	}
+	assert(vy_index_is_scheduled(index));
+	vy_range_delete(index->infinirange);
 	free(index->name);
 	free(index->path);
 	tuple_format_ref(index->surrogate_format, -1);
@@ -7507,9 +7745,9 @@ vy_env_quota_timer_cb(ev_loop *loop, ev_timer *timer, int events)
 	vy_dump_heap_iterator_init(&e->scheduler->dump_heap, &it);
 	struct heap_node *pn = vy_dump_heap_iterator_next(&it);
 	if (pn != NULL) {
-		struct vy_range *range = container_of(pn, struct vy_range,
+		struct vy_index *index = container_of(pn, struct vy_index,
 						      in_dump);
-		max_range_size = range->used;
+		max_range_size = index->used;
 	}
 
 	vy_quota_update_watermark(&e->quota, max_range_size,
@@ -10075,48 +10313,29 @@ vy_read_iterator_add_cache(struct vy_read_iterator *itr)
 }
 
 static void
-vy_read_iterator_add_mem_range(struct vy_read_iterator *itr,
-			       struct vy_range *range)
+vy_read_iterator_add_mem(struct vy_read_iterator *itr)
 {
-	struct vy_iterator_stat *stat = &itr->index->env->stat->mem_stat;
+	struct vy_index *index = itr->index;
+	struct vy_iterator_stat *stat = &index->env->stat->mem_stat;
 	struct vy_merge_src *sub_src;
 
 	/* Add the active in-memory index. */
-	if (range->mem != NULL) {
+	if (index->mem != NULL) {
 		sub_src = vy_merge_iterator_add(&itr->merge_iterator,
 						true, true);
-		vy_mem_iterator_open(&sub_src->mem_iterator, stat , range->mem,
+		vy_mem_iterator_open(&sub_src->mem_iterator, stat , index->mem,
 				     itr->iterator_type, itr->key, itr->vlsn,
-				     NULL);
+				     itr->curr_stmt);
 	}
 	/* Add frozen in-memory indexes. */
 	struct vy_mem *mem;
-	rlist_foreach_entry(mem, &range->frozen, in_frozen) {
+	rlist_foreach_entry(mem, &index->frozen, in_frozen) {
 		sub_src = vy_merge_iterator_add(&itr->merge_iterator,
 						false, true);
 		vy_mem_iterator_open(&sub_src->mem_iterator, stat , mem,
 				     itr->iterator_type, itr->key, itr->vlsn,
-				     NULL);
+				     itr->curr_stmt);
 	}
-}
-
-static void
-vy_read_iterator_add_mem(struct vy_read_iterator *itr)
-{
-	struct vy_range *range = itr->curr_range;
-
-	assert(range != NULL);
-	assert(range->shadow == NULL);
-
-	/*
-	 * The range may be in the middle of split, in which case we
-	 * must add in-memory indexes of new ranges first.
-	 */
-	struct vy_range *r;
-	rlist_foreach_entry(r, &range->split_list, split_list)
-		vy_read_iterator_add_mem_range(itr, r);
-
-	vy_read_iterator_add_mem_range(itr, range);
 }
 
 static void
@@ -10124,22 +10343,35 @@ vy_read_iterator_add_disk(struct vy_read_iterator *itr)
 {
 	assert(itr->curr_range != NULL);
 	assert(itr->curr_range->shadow == NULL);
-	struct vy_iterator_stat *stat = &itr->index->env->stat->run_stat;
+	struct vy_index *index = itr->index;
+	struct vy_range *infinirange = index->infinirange;
+	struct vy_iterator_stat *stat = &index->env->stat->run_stat;
 	struct vy_run *run;
-	struct tuple_format *format = itr->index->surrogate_format;
+	struct tuple_format *format = index->surrogate_format;
 	/*
 	 * The format of the statement must be exactly the space
 	 * format with the same identifier to fully match the
 	 * format in vy_mem.
 	 */
-	if (itr->index->space_index_count == 1)
-		format = itr->index->space_format;
+	if (index->space_index_count == 1)
+		format = index->space_format;
+	rlist_foreach_entry(run, &infinirange->runs, in_range) {
+		struct vy_merge_src *sub_src =
+			vy_merge_iterator_add(&itr->merge_iterator, false,
+					      true);
+		vy_run_iterator_open(&sub_src->run_iterator, stat, infinirange,
+				     run, itr->iterator_type, itr->key,
+				     itr->vlsn, itr->curr_range->end,
+				     itr->curr_stmt, format,
+				     index->upsert_format);
+	}
 	rlist_foreach_entry(run, &itr->curr_range->runs, in_range) {
-		struct vy_merge_src *sub_src = vy_merge_iterator_add(
-			&itr->merge_iterator, false, true);
+		struct vy_merge_src *sub_src =
+			vy_merge_iterator_add(&itr->merge_iterator, false,
+					      true);
 		vy_run_iterator_open(&sub_src->run_iterator, stat,
 				     itr->index, run, itr->iterator_type,
-				     itr->key, itr->vlsn, itr->curr_stmt, NULL,
+				     itr->key, itr->vlsn, NULL, NULL,
 				     format, itr->index->upsert_format);
 	}
 }
@@ -10731,16 +10963,12 @@ vy_squash_process(struct vy_squash *squash)
 		return -1;
 	if (result == NULL)
 		return 0;
-
-	struct vy_range *range;
-	range = vy_range_tree_find_by_key(&index->tree, ITER_EQ, index_def,
-					  result);
 	/*
 	 * While we were reading on-disk runs, new statements could
 	 * have been inserted into the in-memory tree. Apply them to
 	 * the result.
 	 */
-	struct vy_mem *mem = range->mem;
+	struct vy_mem *mem = index->mem;
 	struct tree_mem_key tree_key = {
 		.stmt = result,
 		.lsn = vy_stmt_lsn(result),
@@ -10785,7 +11013,7 @@ vy_squash_process(struct vy_squash *squash)
 	 */
 	size_t mem_used_before = lsregion_used(&env->allocator);
 	const struct tuple *region_stmt = NULL;
-	rc = vy_range_set(range, result, &region_stmt);
+	rc = vy_index_set(index, result, &region_stmt);
 	tuple_unref(result);
 	size_t mem_used_after = lsregion_used(&env->allocator);
 	assert(mem_used_after >= mem_used_before);
