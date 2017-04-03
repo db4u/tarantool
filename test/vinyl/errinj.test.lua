@@ -202,33 +202,26 @@ _ = s:replace{0, 0}
 _ = s:replace{10, 0}
 _ = s:replace{20, 0}
 
-itr = create_iterator(s, {0}, {iterator='GE'})
-
 test_run:cmd("setopt delimiter ';'");
 
-faced5 = false
-faced10 = false
 faced_trash = false
 for i = 1,100 do
     errinj.set("ERRINJ_WAL_WRITE_COUNTDOWN", 0)
     local f = fiber.create(fiber_func)
+    local itr = create_iterator(s, {0}, {iterator='GE'})
     local first = iterator_next(itr)
     local second = iterator_next(itr)
-    if (second[1] == 5) then faced5 = true end
-    if (second[1] == 10) then faced10 = true end
     if (second[1] ~= 5 and second[1] ~= 10) then faced_trash = true end
     while fiber_status <= 1 do fiber.sleep(0.001) end
     local next = iterator_next(itr)
     next = iterator_next(itr)
     next = iterator_next(itr)
-    fiber.join(f)
     errinj.set("ERRINJ_WAL_WRITE_COUNTDOWN", 0xFFFFFFFFFFFFFFFF)
     s:delete{5}
 end;
 
 test_run:cmd("setopt delimiter ''");
 
-faced5
 faced_trash
 
 s:drop()
