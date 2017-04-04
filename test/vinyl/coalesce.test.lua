@@ -48,7 +48,7 @@ test_run:cmd("setopt delimiter ''");
 -- Wait until compaction is over (ranges being compacted can't be coalesced)
 while vyinfo().range_count ~= vyinfo().run_count do fiber.sleep(0.01) end
 
--- Trigger range coalescing by calling snapshot.
+-- Trigger range coalescing by calling compaction.
 s:replace(gen_tuple(math.random(1, key_count))) box.snapshot()
 
 -- Wait until adjacent ranges are coalesced
