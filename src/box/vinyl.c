@@ -7383,14 +7383,14 @@ vy_tx_commit(struct vy_tx *tx, int64_t lsn)
 {
 	assert(tx->state == VINYL_TX_PREPARED);
 
-	if (vy_tx_is_ro(tx)) {
+	if (vy_tx_is_ro(tx)) {\
 		vy_tx_destroy(tx);
 		return;
 	}
 
 	struct tx_manager *xm = tx->manager;
 
-	assert(xm->lsn < lsn);
+	assert(xm->lsn < lsn || (lsn == 0 && xm->lsn == 0));
 	xm->lsn = lsn;
 
 	/* Fix LSNs of the records and commit changes */

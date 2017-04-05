@@ -100,10 +100,8 @@ struct applier {
 	struct rlist on_state;
 	/** Channel used by applier_connect_all() and applier_resume() */
 	struct ipc_channel pause;
-	/** xstream to process rows during initial JOIN */
-	struct xstream *join_stream;
-	/** xstream to process rows during final JOIN and SUBSCRIBE */
-	struct xstream *subscribe_stream;
+	/** xstream to process rows during JOIN and SUBSCRIBE */
+	struct xstream *replica_stream;
 };
 
 /**
@@ -135,8 +133,7 @@ applier_stop(struct applier *applier);
  * @error   throws OutOfMemory exception if out of memory.
  */
 struct applier *
-applier_new(const char *uri, struct xstream *join_stream,
-	    struct xstream *subscribe_stream);
+applier_new(const char *uri, struct xstream *replica_stream);
 
 /**
  * Destroy and delete a applier.

@@ -95,8 +95,7 @@ static bool is_ro = true;
 static const int REPLICATION_CFG_TIMEOUT = 10; /* seconds */
 
 /* Use the shared instance of xstream for all appliers */
-static struct xstream join_stream;
-static struct xstream subscribe_stream;
+static struct xstream replica_stream;
 
 /**
  * The pool of fibers in the transaction processor thread
@@ -310,22 +309,6 @@ wal_stream_create(struct wal_stream *ctx, size_t wal_max_rows)
 	ctx->yield = (wal_max_rows >> 4)  + 1;
 }
 
-static void
-apply_initial_join_row(struct xstream *stream, struct xrow_header *row)
-{
-	(void) stream;
-	struct request *request;
-	request = region_alloc_object_xc(&fiber()->gc, struct request);
-	request_create(request, row->type);
-	assert(row->bodycnt == 1); /* always 1 for read */
-	request_decode_xc(request, (const char *) row->body[0].iov_base,
-			  row->body[0].iov_len);
-	request->header = row;
-	struct space *space = space_cache_find(request->space_id);
-	/* no access checks here - applier always works with admin privs */
-	space->handler->applyInitialJoinRow(space, request);
-}
-
 /* {{{ configuration bindings */
 
 static void
@@ -444,8 +427,7 @@ cfg_get_replication(int *p_count)
 	for (int i = 0; i < count; i++) {
 		const char *source = cfg_getarr_elem("replication", i);
 		struct applier *applier = applier_new(source,
-						      &join_stream,
-						      &subscribe_stream);
+						      &replica_stream);
 		if (applier == NULL) {
 			/* Delete created appliers */
 			while (--i >= 0)
@@ -1543,8 +1525,7 @@ box_cfg_xc(void)
 	title("loading");
 
 	box_set_too_long_threshold();
-	xstream_create(&join_stream, apply_initial_join_row);
-	xstream_create(&subscribe_stream, apply_row);
+	xstream_create(&replica_stream, apply_row);
 
 	struct vclock checkpoint_vclock;
 	vclock_create(&checkpoint_vclock);

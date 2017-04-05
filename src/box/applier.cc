@@ -228,12 +228,12 @@ applier_join(struct applier *applier)
 	/*
 	 * Receive initial data.
 	 */
-	assert(applier->join_stream != NULL);
+	assert(applier->replica_stream != NULL);
 	while (true) {
 		coio_read_xrow(coio, &iobuf->in, &row);
 		applier->last_row_time = ev_now(loop());
 		if (iproto_type_is_dml(row.type)) {
-			xstream_write_xc(applier->join_stream, &row);
+			xstream_write_xc(applier->replica_stream, &row);
 		} else if (row.type == IPROTO_OK) {
 			/*
 			 * Stop vclock. Used to initialize
@@ -266,7 +266,7 @@ applier_join(struct applier *applier)
 		coio_read_xrow(coio, &iobuf->in, &row);
 		applier->last_row_time = ev_now(loop());
 		if (iproto_type_is_dml(row.type)) {
-			xstream_write_xc(applier->subscribe_stream, &row);
+			xstream_write_xc(applier->replica_stream, &row);
 		} else if (row.type == IPROTO_OK) {
 			/*
 			 * Current vclock. This is not used now,
@@ -293,7 +293,7 @@ finish:
 static void
 applier_subscribe(struct applier *applier)
 {
-	assert(applier->subscribe_stream != NULL);
+	assert(applier->replica_stream != NULL);
 
 	/* Send SUBSCRIBE request */
 	struct ev_io *coio = &applier->io;
@@ -366,7 +366,7 @@ applier_subscribe(struct applier *applier)
 			 */
 			vclock_follow(&replicaset_vclock, row.replica_id,
 				      row.lsn);
-			xstream_write_xc(applier->subscribe_stream, &row);
+			xstream_write_xc(applier->replica_stream, &row);
 		}
 		iobuf_reset(iobuf);
 		fiber_gc();
@@ -485,8 +485,7 @@ applier_stop(struct applier *applier)
 }
 
 struct applier *
-applier_new(const char *uri, struct xstream *join_stream,
-	    struct xstream *subscribe_stream)
+applier_new(const char *uri, struct xstream *replica_stream)
 {
 	struct applier *applier = (struct applier *)
 		calloc(1, sizeof(struct applier));
@@ -505,8 +504,7 @@ applier_new(const char *uri, struct xstream *join_stream,
 	assert(rc == 0 && applier->uri.service != NULL);
 	(void) rc;
 
-	applier->join_stream = join_stream;
-	applier->subscribe_stream = subscribe_stream;
+	applier->replica_stream = replica_stream;
 	applier->last_row_time = ev_now(loop());
 	rlist_create(&applier->on_state);
 	ipc_channel_create(&applier->pause, 0);
