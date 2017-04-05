@@ -33,8 +33,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <small/region.h>
+
 #include "diag.h"
 #include "errcode.h"
+#include "fiber.h"
 #include "vclock.h"
 #include "xlog.h"
 
@@ -42,23 +45,14 @@
 #include "replication.h"	/* INSTANCE_UUID */
 #include "wal.h"		/* wal_collect_garbage() */
 
-/** Checkpoint info. */
-struct checkpoint_info {
-	/** Checkpoint vclock, linked in gc_state.checkpoints. */
-	struct vclock vclock;
-	/**
-	 * Number of active users of this checkpoint.
-	 * A checkpoint can't be collected unless @pinned is 0.
-	 */
-	int pinned;
-};
-
 /** Garbage collection state. */
 struct gc_state {
 	/** Max LSN garbage collection has been called for. */
 	int64_t lsn;
 	/** Uncollected checkpoints, see checkpoint_info. */
 	vclockset_t checkpoints;
+	/** Number of tracked checkpoints. */
+	int n_checkpoints;
 };
 static struct gc_state gc;
 
@@ -119,6 +113,7 @@ gc_add_checkpoint(const struct vclock *vclock)
 	cpt->pinned = 1;
 	vclock_copy(&cpt->vclock, vclock);
 	vclockset_insert(&gc.checkpoints, &cpt->vclock);
+	gc.n_checkpoints++;
 
 	if (prev != NULL) {
 		assert(vclock_compare(vclock, prev) > 0);
@@ -187,6 +182,7 @@ gc_run(int64_t lsn)
 
 		struct vclock *next = vclockset_next(&gc.checkpoints, vclock);
 		vclockset_remove(&gc.checkpoints, vclock);
+		gc.n_checkpoints--;
 		free(cpt);
 		vclock = next;
 
@@ -198,4 +194,38 @@ gc_run(int64_t lsn)
 		wal_collect_garbage(gc_lsn);
 		engine_collect_garbage(gc_lsn);
 	}
+}
+
+int64_t
+gc_lsn(void)
+{
+	return gc.lsn;
+}
+
+int
+gc_list_checkpoints(struct checkpoint_info **p_checkpoints)
+{
+	if (gc.n_checkpoints == 0) {
+		*p_checkpoints = NULL;
+		return 0;
+	}
+
+	size_t size = sizeof(struct checkpoint_info) * gc.n_checkpoints;
+	struct checkpoint_info *checkpoints = region_alloc(&fiber()->gc, size);
+	if (checkpoints == NULL) {
+		diag_set(OutOfMemory, size, "region", "checkpoint_info");
+		return -1;
+	}
+
+	int n = 0;
+	for (struct vclock *vclock = vclockset_first(&gc.checkpoints);
+	     vclock != NULL; vclock = vclockset_next(&gc.checkpoints, vclock)) {
+		assert(n < gc.n_checkpoints);
+		checkpoints[n++] = *container_of(vclock,
+				struct checkpoint_info, vclock);
+	}
+
+	assert(n == gc.n_checkpoints);
+	*p_checkpoints = checkpoints;
+	return gc.n_checkpoints;
 }

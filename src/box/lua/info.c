@@ -43,6 +43,7 @@
 #include "box/applier.h"
 #include "box/wal.h"
 #include "box/replication.h"
+#include "box/gc.h"
 #include "main.h"
 #include "box/box.h"
 #include "lua/utils.h"
@@ -248,6 +249,43 @@ lbox_info_vinyl_call(struct lua_State *L)
 }
 
 static int
+lbox_info_gc(struct lua_State *L)
+{
+	lua_newtable(L); /* box.info.gc */
+
+	lua_pushstring(L, "lsn");
+	luaL_pushint64(L, gc_lsn());
+	lua_settable(L, -3);
+
+	struct checkpoint_info *checkpoints;
+	int n_checkpoints = gc_list_checkpoints(&checkpoints);
+	if (n_checkpoints < 0)
+		return luaT_error(L);
+
+	lua_pushstring(L, "checkpoints");
+	lua_createtable(L, n_checkpoints, 0);
+	for (int i = 0; i < n_checkpoints; i++) {
+		struct checkpoint_info *cpt = &checkpoints[i];
+
+		lua_createtable(L, 0, 2);
+
+		lua_pushstring(L, "lsn");
+		luaL_pushint64(L, vclock_sum(&cpt->vclock));
+		lua_settable(L, -3);
+
+		lua_pushstring(L, "pinned");
+		lua_pushinteger(L, cpt->pinned);
+		lua_settable(L, -3);
+
+		lua_rawseti(L, -2, i + 1);
+	}
+	lua_settable(L, -3);
+
+	fiber_gc(); /* free checkpoints */
+	return 1;
+}
+
+static int
 lbox_info_vinyl(struct lua_State *L)
 {
 	lua_newtable(L);
@@ -273,6 +311,7 @@ lbox_info_dynamic_meta [] =
 	{"uptime", lbox_info_uptime},
 	{"pid", lbox_info_pid},
 	{"cluster", lbox_info_cluster},
+	{"gc", lbox_info_gc},
 	{"vinyl", lbox_info_vinyl},
 	{NULL, NULL}
 };

@@ -33,11 +33,22 @@
 
 #include <stdint.h>
 
+#include "vclock.h"
+
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
-struct vclock;
+/** Checkpoint info. */
+struct checkpoint_info {
+	/** Checkpoint vclock, linked in gc_state.checkpoints. */
+	struct vclock vclock;
+	/**
+	 * Number of active users of this checkpoint.
+	 * A checkpoint can't be collected unless @pinned is 0.
+	 */
+	int pinned;
+};
 
 /**
  * Initialize the garbage collection state.
@@ -88,6 +99,27 @@ gc_unpin_checkpoint(struct vclock *vclock);
  */
 void
 gc_run(int64_t lsn);
+
+/**
+ * Return max LSN garbage collection has been invoked for.
+ */
+int64_t
+gc_lsn(void);
+
+/**
+ * Get information about all checkpoints tracked by gc.
+ *
+ * This function allocates an array of struct checkpoint_info,
+ * fills it with information about all tracked checkpoints, and
+ * returns a pointer to the array in @p_checkpoints. The array
+ * is allocated on fiber()->gc. Checkpoints are sorted in the
+ * chronological order with newer checkpoints being closer to
+ * the end of the array.
+ *
+ * Returns the number of checkpoints on success, -1 on OOM.
+ */
+int
+gc_list_checkpoints(struct checkpoint_info **p_checkpoints);
 
 #if defined(__cplusplus)
 } /* extern "C" */
